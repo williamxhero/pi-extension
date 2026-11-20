@@ -22,11 +22,12 @@ async function fixture(t, answer, judge) {
 	const server = createServer(async (req, res) => {
 		const chunks = [];
 		for await (const chunk of req) chunks.push(chunk);
-		const { messages, model } = JSON.parse(Buffer.concat(chunks));
+		const { messages, model, reasoning_effort } = JSON.parse(Buffer.concat(chunks));
+		if (model === "gpt-6.2-sol") assert.equal(reasoning_effort, "medium");
 		const prompt = messages.findLast((message) => message.role === "user").content;
 		const text = typeof prompt === "string" ? prompt : prompt.map((part) => part.text).join("");
-		if (model !== "deepseek-v4.1-flash") requests.push(text);
-		const reply = model === "deepseek-v4.1-flash" ? await judge(JSON.parse(text)) : await answer(text, requests.length);
+		if (model !== "gpt-6.2-sol") requests.push(text);
+		const reply = model === "gpt-6.2-sol" ? await judge(JSON.parse(text)) : await answer(text, requests.length);
 		if (res.destroyed) return;
 		if (typeof reply === "number") {
 			res.writeHead(reply, { "content-type": "application/json" });
@@ -44,7 +45,7 @@ async function fixture(t, answer, judge) {
 	const { port } = server.address();
 	await writeFile(join(cwd, "models.json"), JSON.stringify({ providers: { loopmock: {
 		baseUrl: `http://127.0.0.1:${port}/v1`, api: "openai-completions", apiKey: "test", models: [{ id: "mock" }],
-	}, cpa: { baseUrl: `http://127.0.0.1:${port}/v1`, api: "openai-completions", apiKey: "test", models: [{ id: "deepseek-v4.1-flash" }] } } }));
+	}, cpa: { baseUrl: `http://127.0.0.1:${port}/v1`, api: "openai-completions", apiKey: "test", models: [{ id: "gpt-6.2-sol", reasoning: true }] } } }));
 	await writeFile(join(cwd, "settings.json"), JSON.stringify({ retry: { maxRetries: 1, baseDelayMs: 10 }, telemetry: false }));
 
 	const env = { ...process.env, PI_CODING_AGENT_DIR: cwd, PI_CODING_AGENT_SESSION_DIR: join(cwd, "sessions"), PI_SKIP_VERSION_CHECK: "1" };
@@ -123,6 +124,20 @@ test('enabling an idle task immediately supervises it without another user promp
   await pi.notify('自动续跑：已完成');
   assert.equal(checks,2); assert.equal(pi.requests.length,2);
   assert.match(pi.requests[1],/执行待做验证/);
+  const { readFile } = await import('node:fs/promises');
+  const log = await readFile((await pi.rpc('get_state')).sessionFile, 'utf8');
+  const notes = log.trim().split('\n').map(JSON.parse).filter(e => e.customType === 'loop-to-done.supervisor');
+  assert.equal(notes[0].content, '执行待做验证');
+});
+
+test('restoring an enabled idle task rearms supervision without another prompt', async t => {
+  let checks=0;
+  const pi=await fixture(t,()=> '尚未验证',v=>++checks===1 ? 'invalid' : done(v));
+  await pi.prompt('验证任务'); await pi.settled(1);
+  await pi.prompt('/loop-to-done'); await pi.notify('未取得有效判断');
+  const file=(await pi.rpc('get_state')).sessionFile;
+  await pi.rpc('new_session'); await pi.rpc('switch_session',{sessionPath:file});
+  await pi.notify('自动续跑：已完成'); assert.equal(checks,2);
 });
 
 test('CPA chooses three distinct next steps and stops with evidence', async t => {
