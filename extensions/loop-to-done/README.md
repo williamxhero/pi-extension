@@ -14,8 +14,36 @@
 
 **发送给 CPA 的内容：**当前分支内的用户文本、助手可见回复、近期监督意见，以及工具名和成功/错误标志。摘要请求限制长度，省略工具参数、原始工具输出、附件和思考过程。文本做常见密钥模式的尽力遮盖，并非通用脱敏器；不要在不允许发送到 CPA 的会话中启用。用户需求被截断或依赖未读取的附件时，不会据此直接判定完成或硬阻塞。
 
-**停止与失败：** `/stop-loop-to-done` 取消等待、重试和正在进行的监督调用，不中止主会话已开始的回复。用户发新消息、切换分支、关闭会话或重载扩展会使旧判断失效。手动中止主回复也会关闭续跑。CPA 超时、错误、无法解析或授权缺乏引用时，不发送授权或固定兜底指令；30 秒后退避重试，最长间隔 5 分钟。没有 CPA 模型时也按故障处理。
+**停止与失败：** `/stop-loop-to-done` 取消等待、重试和正在进行的监督调用，不中止主会话已开始的回复。用户发新消息、切换分支、关闭会话或重载扩展会使旧判断失效。手动中止主回复也会关闭续跑。主会话本轮以错误结束（模型报错、额度被拦截、连接失败等）时按硬阻塞停止：写入一条带错误摘要的记录并关闭开关，不再调用 CPA，也不再发送指令，直到手动 `/loop-to-done` 重新开启；这与监督模型自己判定的硬阻塞共用「■ 自动续跑：硬阻塞」状态。CPA 超时、错误、无法解析或授权缺乏引用时，不发送授权或固定兜底指令；30 秒后退避重试，最长间隔 5 分钟。没有 CPA 模型时也按故障处理。
 
 **安装：**把 `loop-to-done.ts` 放到 `~/.pi/agent/extensions/`，在 Pi 中配置 `cpa/gpt-6.2-sol` 后执行 `/reload`。无需为扩展另存密钥。普通会话默认关闭；恢复同一会话保留开关和停止原因，新建或复制的会话不继承开启状态。Pi Web 的 Chat Only 模式不加载扩展。原版 Pi Web 使用状态栏；配套 Web 分叉版的开关在「系统」「工具」右侧。
 
-**验证：**在仓库根目录运行 `node --test extensions/loop-to-done/loop-to-done.test.mjs` 使用隔离 Pi RPC、模拟主模型与 CPA 响应，不使用个人会话或真实模型凭据。
+## 配置（可选）
+
+扩展自己读一份 JSON，两层叠加，后者覆盖前者：
+
+| 文件 | 作用范围 |
+| --- | --- |
+| `<agent 目录>/loop-to-done.json` | 所有项目（`PI_CODING_AGENT_DIR` 优先，默认 `~/.pi/agent`） |
+| `<项目>/.pi/loop-to-done.json` | 仅这个项目；只有目录被信任时才读 |
+
+每个键都可省略：缺失、类型或范围不对的那一项回落默认值，文件整体写坏也不会让续跑停下来。
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `provider` | `cpa` | 监督模型所在 provider |
+| `model` | `gpt-6.2-sol` | 监督模型 |
+| `reasoning` | `medium` | `off` / `minimal` / `low` / `medium` / `high` / `xhigh` |
+| `requestTimeoutMs` | `90000` | 单次监督调用超时 |
+| `initialRetryMs` | `30000` | 失败后首次等待，之后翻倍 |
+| `maxRetryMs` | `300000` | 等待上限（低于首次等待时按首次等待取值） |
+| `snapshotBudgetChars` | `32000` | 发给监督器的会话摘录字符预算 |
+| `maxTokens` | `3000` | 监督回复的 token 上限 |
+| `autoStart` | `false` | 新会话没有历史开关时是否自动开启 |
+| `policyAppend` | `""` | 追加到内置监督规则之后；内置规则不被替换 |
+
+开关本身仍按会话保存（顶部按钮 / `/loop-to-done` / `/stop-loop-to-done`）：**已保存的选择优先于 `autoStart`**，手动关掉的会话不会因为配置而被重新打开。配置在 `session_start` 与每次监督调用前各读一次，改完保存后下一次监督即生效，无需 `/reload`。
+
+Pi Web 配套分叉版可直接在「设置 › 插件」里以表单编辑这份文件（描述来自它自带的 `plugin-configs/loop-to-done.json`）。
+
+**验证：**在仓库根目录运行 `node --test extensions/loop-to-done/loop-to-done.test.mjs` 使用隔离 Pi RPC、模拟主模型与 CPA 响应，不使用个人会话或真实模型凭据。配置读取的单元测试另跑 `node --experimental-strip-types --test extensions/loop-to-done/loop-to-done.config.test.mjs`。

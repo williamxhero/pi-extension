@@ -16,14 +16,16 @@ const command = process.env.PI_TEST_COMMAND || (windows
 	? execFileSync("where.exe", ["pi.cmd"], { encoding: "utf8" }).trim().split(/\r?\n/)[0]
 	: "pi");
 
-async function fixture(t, answer, judge) {
+async function fixture(t, answer, judge, options = {}) {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-loop-test-"));
 	const requests = [];
+	const seen = [];
 	const server = createServer(async (req, res) => {
 		const chunks = [];
 		for await (const chunk of req) chunks.push(chunk);
 		const { messages, model, reasoning_effort } = JSON.parse(Buffer.concat(chunks));
-		if (model === "gpt-6.2-sol") assert.equal(reasoning_effort, "medium");
+		seen.push({ model, reasoning_effort, messages });
+		if (model === "gpt-6.2-sol" && !options.reasoning) assert.equal(reasoning_effort, "medium");
 		const prompt = messages.findLast((message) => message.role === "user").content;
 		const text = typeof prompt === "string" ? prompt : prompt.map((part) => part.text).join("");
 		if (model !== "gpt-6.2-sol") requests.push(text);
@@ -47,6 +49,9 @@ async function fixture(t, answer, judge) {
 		baseUrl: `http://127.0.0.1:${port}/v1`, api: "openai-completions", apiKey: "test", models: [{ id: "mock" }],
 	}, cpa: { baseUrl: `http://127.0.0.1:${port}/v1`, api: "openai-completions", apiKey: "test", models: [{ id: "gpt-6.2-sol", reasoning: true }] } } }));
 	await writeFile(join(cwd, "settings.json"), JSON.stringify({ retry: { maxRetries: 1, baseDelayMs: 10 }, telemetry: false }));
+	if (options.agentConfig) {
+		await writeFile(join(cwd, "loop-to-done.json"), JSON.stringify(options.agentConfig));
+	}
 
 	const env = { ...process.env, PI_CODING_AGENT_DIR: cwd, PI_CODING_AGENT_SESSION_DIR: join(cwd, "sessions"), PI_SKIP_VERSION_CHECK: "1" };
 	const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-mcp",
@@ -109,7 +114,7 @@ async function fixture(t, answer, judge) {
 	};
 	const commands = (await rpc("get_commands")).commands.map((command) => command.name);
 	assert.ok(commands.includes("loop-to-done") && commands.includes("stop-loop-to-done"));
-	return { requests, rpc, prompt, notify, settled, received, expectLoopStatus };
+	return { requests, seen, rpc, prompt, notify, settled, received, expectLoopStatus };
 }
 
 const rows = (v, role) => v.rows.filter(r => r.role === role);
@@ -169,6 +174,57 @@ test('naked completion and unsupported blocker require verification, not closure
 for(const bad of [503,'not json',JSON.stringify({action:'authorize',necessity:'必需',scope:'invented',reply:'发起操作'})])test('invalid decision or CPA failure sends nothing: '+String(bad).slice(0,35),async t=>{
   const pi=await fixture(t,()=> '需要核查',()=>bad);await pi.prompt('/loop-to-done');await pi.prompt('task');await pi.notify('未取得有效判断');pi.expectLoopStatus('● 自动续跑：已开启');
   await pi.prompt('/stop-loop-to-done');assert.deepEqual(pi.requests,['task']);
+});
+
+test('a settings file turns supervision on, changes reasoning, and appends to the policy', async t => {
+  const pi = await fixture(t, () => '已执行并验证', () => JSON.stringify({ action: 'continue', reply: '继续下一步' }), {
+    reasoning: 'high',
+    agentConfig: { autoStart: true, reasoning: 'high', policyAppend: '本仓库只允许改动 extensions/。' },
+  });
+  pi.expectLoopStatus('● 自动续跑：已开启');
+  await pi.prompt('完成任务');
+  await pi.received(2);
+  const supervisor = pi.seen.filter((request) => request.model === 'gpt-6.2-sol');
+  assert.ok(supervisor.length >= 1, 'the supervisor was consulted without /loop-to-done');
+  assert.equal(supervisor[0].reasoning_effort, 'high', 'the configured reasoning level reaches the request');
+  assert.match(JSON.stringify(supervisor[0]), /本仓库只允许改动 extensions\//, 'the appended policy text reaches the request');
+  assert.match(pi.requests.at(-1), /继续下一步/);
+});
+
+test('a saved manual stop wins over autoStart', async t => {
+  const pi = await fixture(t, () => '已执行', () => JSON.stringify({ action: 'continue', reply: '不应出现' }), {
+    agentConfig: { autoStart: true },
+  });
+  await pi.prompt('/stop-loop-to-done');
+  await pi.prompt('普通任务');
+  await pi.settled(1);
+  await delay(300);
+  assert.deepEqual(pi.seen.filter((request) => request.model === 'gpt-6.2-sol'), [], 'no supervision after a manual stop');
+  assert.deepEqual(pi.requests, ['普通任务']);
+});
+
+test('a main-session request error is a hard blocker that stops sending', async t => {
+  let checks=0;
+  const pi=await fixture(t,()=>500,v=>{checks++;return JSON.stringify({action:'continue',reply:'继续执行'});});
+  await pi.prompt('/loop-to-done');await pi.prompt('执行任务');
+  await pi.notify('自动续跑已停止');pi.expectLoopStatus('■ 自动续跑：硬阻塞');
+  await delay(300);assert.equal(checks,0);
+  const { readFile } = await import('node:fs/promises');
+  const log = await readFile((await pi.rpc('get_state')).sessionFile,'utf8');
+  const notes = log.trim().split('\n').map(JSON.parse).filter(e=>e.customType==='loop-to-done.supervisor');
+  assert.equal(notes.length,1);assert.match(notes[0].content,/硬阻塞/);assert.match(notes[0].content,/500/);
+});
+
+test('a supervised turn that errors stops instead of asking the supervisor again', async t => {
+  let checks=0;
+  const pi=await fixture(t,(_p,i)=>i===1?'已处理一步':500,v=>{checks++;return JSON.stringify({action:'continue',reply:'继续执行第二步'});});
+  await pi.prompt('/loop-to-done');await pi.prompt('执行任务');
+  await pi.notify('自动续跑已停止');pi.expectLoopStatus('■ 自动续跑：硬阻塞');
+  await delay(300);assert.equal(checks,1);
+  const { readFile } = await import('node:fs/promises');
+  const log = await readFile((await pi.rpc('get_state')).sessionFile,'utf8');
+  const notes = log.trim().split('\n').map(JSON.parse).filter(e=>e.customType==='loop-to-done.supervisor').map(e=>e.content);
+  assert.deepEqual(notes.map(n=>n.includes('硬阻塞')),[false,true]);
 });
 
 for(const interrupt of ['stop','new instruction'])test('late CPA answer is discarded: '+interrupt,async t=>{
